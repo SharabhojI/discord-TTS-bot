@@ -21,6 +21,7 @@ tts_queue = deque(maxlen=10)  # Limit the queue to 10 items
 TTS_CHANNEL_ID = None  # Stores the ID of the channel designated for TTS
 inactivity_timer = 600 # Timer for Auto-disconnect, default 10 mins
 last_activity = {} # Track the last time there was bot activity across guilds
+last_user = {} # Track the last user who sent a TTS message
 
 ## Event Handlers ##
 @client.event
@@ -161,33 +162,40 @@ async def clearqueue(ctx: discord.Interaction):
 
 ## Read from channel to TTS ##
 async def tts_from_message(message):
+    global last_user
     try:
         if message.guild.voice_client:
             # Get the user's preferences, or revert to default values
+            print(f"Processing TTS for message: '{message.content}' from {message.author}")
             user_pref = user_preferences.get(message.author.id, {})
             lang = user_pref.get('lang', 'en')
             speed = user_pref.get('speed', 1.0)
             pitch = user_pref.get('pitch', 1.0)
-            tld = user_pref.get('tld', 'com')
-            
+            # tld = user_pref.get('tld', 'com')
+
             # Remove URLs
             content = re.sub(r'http\S+', '', message.content)
-            
+
             # Replace mentions with usernames
             for user in message.mentions:
                 content = content.replace(f'<@{user.id}>', user.display_name)
-                
+
             # Handle attachments
             if message.attachments:
                 for attachment in message.attachments:
                     if not attachment.filename.endswith(('.txt', '.md')):
                         return
-            
+
+            # Add the "username says" prefix if the user is different from the last user
+            if message.author.id != last_user.get(message.guild.id):
+                content = f"{message.author.display_name} says {content}"
+                last_user[message.guild.id] = message.author.id
+
             # Convert the text to speech with Google TTS
-            tts = gTTS(content, lang=lang, tld=tld, slow=speed < 1.0)
+            tts = gTTS(content, lang=lang, slow=speed < 1.0)
             file_path = f"tts_{message.author.id}.mp3"
             tts.save(file_path)
-            last_activity[message.guild.id] = discord.utils.utcnow() # Update activity tracker
+            last_activity[message.guild.id] = discord.utils.utcnow()  # Update activity tracker
 
             # Adjust pitch with ffmpeg
             if pitch != 1.0:
@@ -195,13 +203,12 @@ async def tts_from_message(message):
                 subprocess.run(["ffmpeg", '-i', file_path, '-filter:a', f"asetrate=44100*{pitch}", pitch_file_path])
                 os.remove(file_path)
                 file_path = pitch_file_path
-                
+
             tts_queue.append((message.guild.voice_client, file_path))
             await process_tts_queue()
         else:
             await message.channel.send("I need to be in a voice channel first. Use /join to invite me.", ephemeral=True)
     except Exception as e:
-        #await message.channel.send(f"Error: {e}")
         print(f"Error processing TTS: {e}")
 
 async def process_tts_queue():
@@ -232,7 +239,7 @@ async def check_inactivity():
 def after_playing(file_path):
     if os.path.exists(file_path):
         os.remove(file_path)
-    client.loop.create_task(process_tts_queue())
+    asyncio.run_coroutine_threadsafe(process_tts_queue(), client.loop)
 
 ## Run the bot with stored token ##
 token = os.getenv('BOT_TOKEN')
