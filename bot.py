@@ -163,6 +163,7 @@ async def clearqueue(ctx: discord.Interaction):
 ## Read from channel to TTS ##
 async def tts_from_message(message):
     global last_user
+    global last_activity
     try:
         if message.guild.voice_client:
             # Get the user's preferences, or revert to default values
@@ -211,15 +212,34 @@ async def tts_from_message(message):
     except Exception as e:
         print(f"Error processing TTS: {e}")
 
+queue_lock = asyncio.Lock()
 async def process_tts_queue():
-    while tts_queue:
-        voice_client, file_path = tts_queue.popleft()
-        if not voice_client.is_playing():
-            voice_client.play(discord.FFmpegPCMAudio(executable="ffmpeg", source=file_path),
-                              after=lambda e: after_playing(file_path))
-            await asyncio.sleep(1)  # Give it a moment before checking the next item in the queue
+    async with queue_lock:
+        while tts_queue:
+            voice_client, file_path = tts_queue.popleft()
+            if not voice_client.is_playing():
+                voice_client.play(discord.FFmpegPCMAudio(executable="ffmpeg", source=file_path),
+                                after=lambda e: asyncio.run_coroutine_threadsafe(after_playing(file_path), client.loop))
+                await asyncio.sleep(1)  # Give it a moment before checking the next item in the queue
+
+## Inactivity functions ##
+async def cleanup_inactive_users():
+    global user_preferences, last_user, last_activity
+    current_time = discord.utils.utcnow()
+    inactive_threshold = timedelta(days=30)  # Adjust as needed
+
+    for guild_id in list(last_activity.keys()):
+        if current_time - last_activity[guild_id] > inactive_threshold:
+            del last_activity[guild_id]
+            if guild_id in last_user:
+                del last_user[guild_id]
+
+    for user_id in list(user_preferences.keys()):
+        if not client.get_user(user_id):  # User no longer in any mutual guilds
+            del user_preferences[user_id]
 
 async def check_inactivity():
+    global last_activity
     await client.wait_until_ready()
     while not client.is_closed():
         try:
@@ -230,17 +250,20 @@ async def check_inactivity():
                     if voice_client and voice_client.is_connected():
                         await voice_client.disconnect()
                         print(f"Disconnected from guild {guild_id} due to inactivity.")
-                        del last_activity_time[guild_id]  # Remove the entry to avoid repeated checks
+                        del last_activity[guild_id]  # Remove the entry to avoid repeated checks
+            if current_time.minute == 0: # cleanup users every hour
+                await cleanup_inactive_users()
         except Exception as e:
             print(f"Error checking for inactivity: {e}")
         await asyncio.sleep(60)  # Check every minute
 
 ## Clean up generated TTS file after playing ##
-def after_playing(file_path):
+async def after_playing(file_path):
     if os.path.exists(file_path):
         os.remove(file_path)
-    asyncio.run_coroutine_threadsafe(process_tts_queue(), client.loop)
+    await process_tts_queue()
 
 ## Run the bot with stored token ##
 token = os.getenv('BOT_TOKEN')
+client.loop.create_task(check_inactivity())
 client.run(token)
