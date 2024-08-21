@@ -11,13 +11,14 @@ from collections import deque
 from datetime import timedelta
 import asyncio
 import subprocess
+import traceback
 
 load_dotenv() # load .env containing bot token
 intents = discord.Intents.all() # set bot intents
 
 client = commands.Bot(command_prefix='-', intents=intents)
 user_preferences = {} # Dictionary to store user preferences
-tts_queue = deque(maxlen=10)  # Limit the queue to 10 items
+tts_queue = asyncio.Queue()
 TTS_CHANNEL_ID = None  # Stores the ID of the channel designated for TTS
 inactivity_timer = 600 # Timer for Auto-disconnect, default 10 mins
 last_activity = {} # Track the last time there was bot activity across guilds
@@ -37,7 +38,6 @@ async def on_ready():
 async def on_message(message):
     if message.author == client.user or not message.guild:
         return
-    #print(f"Received message: '{message.content}' from {message.author} in channel {message.channel}")
     if message.guild.voice_client and message.guild.voice_client.is_connected() and message.channel.id == TTS_CHANNEL_ID:
         await tts_from_message(message)
     await client.process_commands(message)
@@ -57,12 +57,11 @@ async def join(ctx: discord.Interaction):
                 await ctx.followup.send("I don't have permission to join or speak in this voice channel.", ephemeral=True)
                 return
             await channel.connect()
-            await ctx.followup.send("Joined {channel.name}. Messages sent to the designated TTS text channel will be read aloud.", ephemeral=True)
+            await ctx.followup.send(f"Joined {channel.name}. Messages sent to the designated TTS text channel will be read aloud.", ephemeral=True)
         else:
             await ctx.followup.send("You need to join a voice channel first!", ephemeral=True)
     except Exception as e:
         await ctx.followup.send(f"Error joining: {e}", ephemeral=True)
-        #print(f"Error: {e}")
 
 @client.tree.command(
     name='leave',
@@ -125,7 +124,7 @@ async def setspeed(ctx: discord.Interaction, speed: float):
         await ctx.response.send_message(f"Speed set to {speed}x", ephemeral=True)
     except Exception as e:
         await ctx.response.send_message(f"Error in setting speed: {e}", ephemeral=True)
-        
+
 @client.tree.command(
     name='setpitch',
     description='Dom Bousta dislikes his heralds manner of speech...'
@@ -137,7 +136,7 @@ async def setpitch(ctx: discord.Interaction, pitch: float):
         await ctx.response.send_message(f"Pitch set to {pitch}", ephemeral=True)
     except Exception as e:
         await ctx.response.send_message(f"Error in setting pitch: {e}", ephemeral=True)
-        
+
 @client.tree.command(
     name='listlang',
     description='Dom Bousta wishes to know the languages spoken in his court...'
@@ -155,7 +154,8 @@ async def listlang(ctx: discord.Interaction):
 )
 async def clearqueue(ctx: discord.Interaction):
     try:
-        tts_queue.clear()
+        while not tts_queue.empty():
+            await tts_queue.get()
         await ctx.response.send_message("The TTS queue has been cleared.", ephemeral=True)
     except Exception as e:
         await ctx.response.send_message(f"Error clearing queue: {e}", ephemeral=True)
@@ -166,61 +166,67 @@ async def tts_from_message(message):
     global last_activity
     try:
         if message.guild.voice_client:
-            # Get the user's preferences, or revert to default values
-            print(f"Processing TTS for message: '{message.content}' from {message.author}")
             user_pref = user_preferences.get(message.author.id, {})
             lang = user_pref.get('lang', 'en')
             speed = user_pref.get('speed', 1.0)
             pitch = user_pref.get('pitch', 1.0)
-            # tld = user_pref.get('tld', 'com')
 
-            # Remove URLs
             content = re.sub(r'http\S+', '', message.content)
 
-            # Replace mentions with usernames
             for user in message.mentions:
                 content = content.replace(f'<@{user.id}>', user.display_name)
 
-            # Handle attachments
-            if message.attachments:
-                for attachment in message.attachments:
-                    if not attachment.filename.endswith(('.txt', '.md')):
-                        return
-
-            # Add the "username says" prefix if the user is different from the last user
             if message.author.id != last_user.get(message.guild.id):
                 content = f"{message.author.display_name} says {content}"
                 last_user[message.guild.id] = message.author.id
 
-            # Convert the text to speech with Google TTS
             tts = gTTS(content, lang=lang, slow=speed < 1.0)
-            file_path = f"tts_{message.author.id}.mp3"
+            file_path = f"tts_{message.author.id}_{message.id}.mp3"
             tts.save(file_path)
-            last_activity[message.guild.id] = discord.utils.utcnow()  # Update activity tracker
+            last_activity[message.guild.id] = discord.utils.utcnow()
 
-            # Adjust pitch with ffmpeg
             if pitch != 1.0:
-                pitch_file_path = f"tts_pitch_{message.author.id}.mp3"
+                pitch_file_path = f"tts_pitch_{message.author.id}_{message.id}.mp3"
                 subprocess.run(["ffmpeg", '-i', file_path, '-filter:a', f"asetrate=44100*{pitch}", pitch_file_path])
                 os.remove(file_path)
                 file_path = pitch_file_path
 
-            tts_queue.append((message.guild.voice_client, file_path))
-            await process_tts_queue()
+            await tts_queue.put((message.guild.voice_client, file_path))
+            if not hasattr(client, 'tts_task') or client.tts_task.done():
+                client.tts_task = asyncio.create_task(process_tts_queue())
         else:
             await message.channel.send("I need to be in a voice channel first. Use /join to invite me.", ephemeral=True)
     except Exception as e:
         print(f"Error processing TTS: {e}")
+        traceback.print_exc()
 
-queue_lock = asyncio.Lock()
 async def process_tts_queue():
-    async with queue_lock:
-        while tts_queue:
-            voice_client, file_path = tts_queue.popleft()
-            if not voice_client.is_playing():
+    while True:
+        voice_client, file_path = await tts_queue.get()
+        try:
+            if voice_client.is_connected() and os.path.exists(file_path):
+                # Wait for any current playback to finish
+                while voice_client.is_playing():
+                    await asyncio.sleep(0.1)
+                # Play the next message in the queue
                 voice_client.play(discord.FFmpegPCMAudio(executable="ffmpeg", source=file_path),
-                                after=lambda e: asyncio.run_coroutine_threadsafe(after_playing(file_path), client.loop))
-                await asyncio.sleep(1)  # Give it a moment before checking the next item in the queue
+                                  after=lambda e: asyncio.run_coroutine_threadsafe(after_playing(file_path), client.loop))
+                # Wait for this message to finish playing
+                while voice_client.is_playing():
+                    await asyncio.sleep(0.1)
+            else:
+                print(f"Voice client disconnected or file not found: {file_path}")
+        except Exception as e:
+            print(f"Error processing TTS file {file_path}: {e}")
+        finally:
+            if tts_queue.empty():
+                return
+            else:
+                tts_queue.task_done()
+
+async def after_playing(file_path):
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
 ## Inactivity functions ##
 async def cleanup_inactive_users():
@@ -257,13 +263,10 @@ async def check_inactivity():
             print(f"Error checking for inactivity: {e}")
         await asyncio.sleep(60)  # Check every minute
 
-## Clean up generated TTS file after playing ##
-async def after_playing(file_path):
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    await process_tts_queue()
+async def setup_hook():
+    client.loop.create_task(check_inactivity())
+client.setup_hook = setup_hook
 
 ## Run the bot with stored token ##
 token = os.getenv('BOT_TOKEN')
-client.loop.create_task(check_inactivity())
 client.run(token)
